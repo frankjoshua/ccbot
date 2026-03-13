@@ -45,14 +45,8 @@ def main() -> None:
     logging.getLogger("telegram.ext.AIORateLimiter").setLevel(logging.INFO)
     logger = logging.getLogger(__name__)
 
-    from .tmux_manager import tmux_manager
-
     logger.info("Allowed users: %s", config.allowed_users)
     logger.info("Claude projects path: %s", config.claude_projects_path)
-
-    # Ensure tmux session exists
-    session = tmux_manager.get_or_create_session()
-    logger.info("Tmux session '%s' ready", session.session_name)
 
     logger.info("Starting Telegram bot...")
     from .bot import create_bot

@@ -1,10 +1,12 @@
 """Tmux session/window management via libtmux.
 
-Wraps libtmux to provide async-friendly operations on a single tmux session:
+Wraps libtmux to provide async-friendly operations across ALL tmux sessions:
   - list_windows / find_window_by_name: discover Claude Code windows.
   - capture_pane: read terminal content (plain or with ANSI colors).
   - send_keys: forward user input or control keys to a window.
   - create_window / kill_window: lifecycle management.
+
+Windows are identified by composite refs: "session_name:@window_id".
 
 All blocking libtmux calls are wrapped in asyncio.to_thread().
 
@@ -25,59 +27,58 @@ from .config import SENSITIVE_ENV_VARS, config
 logger = logging.getLogger(__name__)
 
 
+def parse_window_ref(ref: str) -> tuple[str, str]:
+    """Parse 'session_name:@window_id' into (session_name, window_id).
+
+    Raises ValueError if format is invalid.
+    """
+    if not ref or ":" not in ref:
+        raise ValueError(f"Invalid window ref '{ref}': expected 'session:@id'")
+    session, _, window_id = ref.partition(":")
+    if not session or not window_id:
+        raise ValueError(f"Invalid window ref '{ref}': expected 'session:@id'")
+    return session, window_id
+
+
 @dataclass
 class TmuxWindow:
     """Information about a tmux window."""
 
+    ref: str  # Composite ref: "session_name:@window_id"
     window_id: str
+    session_name: str
     window_name: str
     cwd: str  # Current working directory
     pane_current_command: str = ""  # Process running in active pane
 
 
 class TmuxManager:
-    """Manages tmux windows for Claude Code sessions."""
+    """Manages tmux windows for Claude Code sessions across all tmux sessions."""
 
-    def __init__(self, session_name: str | None = None):
-        """Initialize tmux manager.
+    def __init__(self) -> None:
+        """Initialize tmux manager."""
+        pass
 
-        Args:
-            session_name: Name of the tmux session to use (default from config)
-        """
-        self.session_name = session_name or config.tmux_session_name
-        self._server: libtmux.Server | None = None
-
-    @property
-    def server(self) -> libtmux.Server:
-        """Get or create tmux server connection."""
-        if self._server is None:
-            self._server = libtmux.Server()
-        return self._server
-
-    def get_session(self) -> libtmux.Session | None:
-        """Get the tmux session if it exists."""
-        try:
-            return self.server.sessions.get(session_name=self.session_name)
-        except Exception:
+    def _find_pane_sync(self, ref: str) -> libtmux.Pane | None:
+        """Resolve composite ref to a libtmux Pane (sync, for use in to_thread)."""
+        session_name, window_id = parse_window_ref(ref)
+        server = libtmux.Server()
+        session = server.sessions.get(session_name=session_name)
+        if not session:
             return None
+        window = next((w for w in session.windows if w.window_id == window_id), None)
+        if not window:
+            return None
+        return window.panes[0]
 
-    def get_or_create_session(self) -> libtmux.Session:
-        """Get existing session or create a new one."""
-        session = self.get_session()
-        if session:
-            self._scrub_session_env(session)
-            return session
-
-        # Create new session with main window named specifically
-        session = self.server.new_session(
-            session_name=self.session_name,
-            start_directory=str(Path.home()),
-        )
-        # Rename the default window to the main window name
-        if session.windows:
-            session.windows[0].rename_window(config.tmux_main_window_name)
-        self._scrub_session_env(session)
-        return session
+    def _find_window_sync(self, ref: str) -> libtmux.Window | None:
+        """Resolve composite ref to a libtmux Window (sync, for use in to_thread)."""
+        session_name, window_id = parse_window_ref(ref)
+        server = libtmux.Server()
+        session = server.sessions.get(session_name=session_name)
+        if not session:
+            return None
+        return next((w for w in session.windows if w.window_id == window_id), None)
 
     @staticmethod
     def _scrub_session_env(session: libtmux.Session) -> None:
@@ -93,47 +94,50 @@ class TmuxManager:
                 pass  # var not set in session env — nothing to remove
 
     async def list_windows(self) -> list[TmuxWindow]:
-        """List all windows in the session with their working directories.
+        """List all windows across ALL tmux sessions.
 
         Returns:
             List of TmuxWindow with window info and cwd
         """
 
         def _sync_list_windows() -> list[TmuxWindow]:
-            windows = []
-            session = self.get_session()
+            server = libtmux.Server()
+            result: list[TmuxWindow] = []
+            for session in server.sessions:
+                for window in session.windows:
+                    name = window.window_name or ""
+                    # Skip the main window (placeholder window)
+                    if name == config.tmux_main_window_name:
+                        continue
 
-            if not session:
-                return windows
+                    try:
+                        # Get the active pane's current path and command
+                        pane = window.active_pane
+                        if pane:
+                            cwd = pane.pane_current_path or ""
+                            pane_cmd = pane.pane_current_command or ""
+                        else:
+                            cwd = ""
+                            pane_cmd = ""
 
-            for window in session.windows:
-                name = window.window_name or ""
-                # Skip the main window (placeholder window)
-                if name == config.tmux_main_window_name:
-                    continue
+                        wid = window.window_id or ""
+                        sname = session.session_name or ""
+                        ref = f"{sname}:{wid}"
 
-                try:
-                    # Get the active pane's current path and command
-                    pane = window.active_pane
-                    if pane:
-                        cwd = pane.pane_current_path or ""
-                        pane_cmd = pane.pane_current_command or ""
-                    else:
-                        cwd = ""
-                        pane_cmd = ""
-
-                    windows.append(
-                        TmuxWindow(
-                            window_id=window.window_id or "",
-                            window_name=name,
-                            cwd=cwd,
-                            pane_current_command=pane_cmd,
+                        result.append(
+                            TmuxWindow(
+                                ref=ref,
+                                window_id=wid,
+                                session_name=sname,
+                                window_name=name,
+                                cwd=cwd,
+                                pane_current_command=pane_cmd,
+                            )
                         )
-                    )
-                except Exception as e:
-                    logger.debug(f"Error getting window info: {e}")
+                    except Exception as e:
+                        logger.debug(f"Error getting window info: {e}")
 
-            return windows
+            return result
 
         return await asyncio.to_thread(_sync_list_windows)
 
@@ -154,18 +158,28 @@ class TmuxManager:
         return None
 
     async def find_window_by_id(self, window_id: str) -> TmuxWindow | None:
-        """Find a window by its tmux window ID (e.g. '@0', '@12').
+        """Find a window by composite ref or bare window ID.
+
+        Accepts either a composite ref like 'session:@12' or a bare
+        window ID like '@12' (searches all sessions for backward compat).
 
         Args:
-            window_id: The tmux window ID to match
+            window_id: Composite ref or bare tmux window ID
 
         Returns:
             TmuxWindow if found, None otherwise
         """
         windows = await self.list_windows()
-        for window in windows:
-            if window.window_id == window_id:
-                return window
+        # If it's a composite ref, match on ref
+        if ":" in window_id:
+            for window in windows:
+                if window.ref == window_id:
+                    return window
+        else:
+            # Bare window ID — search across all sessions
+            for window in windows:
+                if window.window_id == window_id:
+                    return window
         logger.debug("Window not found by id: %s", window_id)
         return None
 
@@ -173,12 +187,14 @@ class TmuxManager:
         """Capture the visible text content of a window's active pane.
 
         Args:
-            window_id: The window ID to capture
+            window_id: Composite ref (session:@id) or bare window ID
             with_ansi: If True, capture with ANSI color codes
 
         Returns:
             The captured text, or None on failure.
         """
+        # Resolve the target for tmux CLI: if composite ref, use it as-is for -t
+        # tmux CLI understands "session:@id" natively
         if with_ansi:
             # Use async subprocess to call tmux capture-pane -e for ANSI colors
             try:
@@ -205,16 +221,21 @@ class TmuxManager:
 
         # Original implementation for plain text - wrap in thread
         def _sync_capture() -> str | None:
-            session = self.get_session()
-            if not session:
+            pane = self._find_pane_sync(window_id) if ":" in window_id else None
+            if not pane:
+                # Fallback: bare window ID, search all sessions
+                server = libtmux.Server()
+                for session in server.sessions:
+                    try:
+                        window = session.windows.get(window_id=window_id)
+                        if window:
+                            pane = window.active_pane
+                            break
+                    except Exception:
+                        continue
+            if not pane:
                 return None
             try:
-                window = session.windows.get(window_id=window_id)
-                if not window:
-                    return None
-                pane = window.active_pane
-                if not pane:
-                    return None
                 lines = pane.capture_pane()
                 return "\n".join(lines) if isinstance(lines, list) else str(lines)
             except Exception as e:
@@ -229,7 +250,7 @@ class TmuxManager:
         """Send keys to a specific window.
 
         Args:
-            window_id: The window ID to send to
+            window_id: Composite ref (session:@id) or bare window ID
             text: Text to send
             enter: Whether to press enter after the text
             literal: If True, send text literally. If False, interpret special keys
@@ -245,19 +266,11 @@ class TmuxManager:
             # rather than submit.  A 500ms gap lets the TUI process the
             # text before receiving Enter.
             def _send_literal(chars: str) -> bool:
-                session = self.get_session()
-                if not session:
-                    logger.error("No tmux session found")
+                pane = self._resolve_pane_sync(window_id)
+                if not pane:
+                    logger.error(f"Window {window_id} not found")
                     return False
                 try:
-                    window = session.windows.get(window_id=window_id)
-                    if not window:
-                        logger.error(f"Window {window_id} not found")
-                        return False
-                    pane = window.active_pane
-                    if not pane:
-                        logger.error(f"No active pane in window {window_id}")
-                        return False
                     pane.send_keys(chars, enter=False, literal=True)
                     return True
                 except Exception as e:
@@ -265,16 +278,10 @@ class TmuxManager:
                     return False
 
             def _send_enter() -> bool:
-                session = self.get_session()
-                if not session:
+                pane = self._resolve_pane_sync(window_id)
+                if not pane:
                     return False
                 try:
-                    window = session.windows.get(window_id=window_id)
-                    if not window:
-                        return False
-                    pane = window.active_pane
-                    if not pane:
-                        return False
                     pane.send_keys("", enter=True, literal=False)
                     return True
                 except Exception as e:
@@ -299,42 +306,52 @@ class TmuxManager:
 
         # Other cases: special keys (literal=False) or no-enter
         def _sync_send_keys() -> bool:
-            session = self.get_session()
-            if not session:
-                logger.error("No tmux session found")
+            pane = self._resolve_pane_sync(window_id)
+            if not pane:
+                logger.error(f"Window {window_id} not found")
                 return False
-
             try:
-                window = session.windows.get(window_id=window_id)
-                if not window:
-                    logger.error(f"Window {window_id} not found")
-                    return False
-
-                pane = window.active_pane
-                if not pane:
-                    logger.error(f"No active pane in window {window_id}")
-                    return False
-
                 pane.send_keys(text, enter=enter, literal=literal)
                 return True
-
             except Exception as e:
                 logger.error(f"Failed to send keys to window {window_id}: {e}")
                 return False
 
         return await asyncio.to_thread(_sync_send_keys)
 
-    async def rename_window(self, window_id: str, new_name: str) -> bool:
-        """Rename a tmux window by its ID."""
-
-        def _sync_rename() -> bool:
-            session = self.get_session()
-            if not session:
-                return False
+    def _resolve_pane_sync(self, window_id: str) -> libtmux.Pane | None:
+        """Resolve window_id (composite ref or bare) to a libtmux Pane."""
+        if ":" in window_id:
+            return self._find_pane_sync(window_id)
+        # Bare window ID — search all sessions
+        server = libtmux.Server()
+        for session in server.sessions:
             try:
                 window = session.windows.get(window_id=window_id)
-                if not window:
-                    return False
+                if window:
+                    return window.active_pane
+            except Exception:
+                continue
+        return None
+
+    async def rename_window(self, window_id: str, new_name: str) -> bool:
+        """Rename a tmux window by composite ref or bare window ID."""
+
+        def _sync_rename() -> bool:
+            window = self._find_window_sync(window_id) if ":" in window_id else None
+            if not window:
+                # Fallback: bare window ID, search all sessions
+                server = libtmux.Server()
+                for session in server.sessions:
+                    try:
+                        window = session.windows.get(window_id=window_id)
+                        if window:
+                            break
+                    except Exception:
+                        continue
+            if not window:
+                return False
+            try:
                 window.rename_window(new_name)
                 logger.info("Renamed window %s to '%s'", window_id, new_name)
                 return True
@@ -345,16 +362,23 @@ class TmuxManager:
         return await asyncio.to_thread(_sync_rename)
 
     async def kill_window(self, window_id: str) -> bool:
-        """Kill a tmux window by its ID."""
+        """Kill a tmux window by composite ref or bare window ID."""
 
         def _sync_kill() -> bool:
-            session = self.get_session()
-            if not session:
+            window = self._find_window_sync(window_id) if ":" in window_id else None
+            if not window:
+                # Fallback: bare window ID, search all sessions
+                server = libtmux.Server()
+                for session in server.sessions:
+                    try:
+                        window = session.windows.get(window_id=window_id)
+                        if window:
+                            break
+                    except Exception:
+                        continue
+            if not window:
                 return False
             try:
-                window = session.windows.get(window_id=window_id)
-                if not window:
-                    return False
                 window.kill()
                 logger.info("Killed window %s", window_id)
                 return True
@@ -364,6 +388,9 @@ class TmuxManager:
 
         return await asyncio.to_thread(_sync_kill)
 
+    # DEPRECATED: create_window uses get_or_create_session which creates a ccbot
+    # session. Will be replaced in Task 4 with create_session that creates
+    # windows in the appropriate existing session.
     async def create_window(
         self,
         work_dir: str,
@@ -372,6 +399,9 @@ class TmuxManager:
         resume_session_id: str | None = None,
     ) -> tuple[bool, str, str, str]:
         """Create a new tmux window and optionally start Claude Code.
+
+        DEPRECATED: This still creates windows in a single 'ccbot' session.
+        Will be replaced in Task 4.
 
         Args:
             work_dir: Working directory for the new window
@@ -401,7 +431,17 @@ class TmuxManager:
 
         # Create window in thread
         def _create_and_start() -> tuple[bool, str, str, str]:
-            session = self.get_or_create_session()
+            server = libtmux.Server()
+            session_name = config.tmux_session_name
+            session = server.sessions.get(session_name=session_name)
+            if not session:
+                session = server.new_session(
+                    session_name=session_name,
+                    start_directory=str(Path.home()),
+                )
+                if session.windows:
+                    session.windows[0].rename_window(config.tmux_main_window_name)
+            self._scrub_session_env(session)
             try:
                 # Create new window
                 window = session.new_window(
@@ -443,5 +483,5 @@ class TmuxManager:
         return await asyncio.to_thread(_create_and_start)
 
 
-# Global instance with default session name
+# Global instance — no longer tied to a single session
 tmux_manager = TmuxManager()
