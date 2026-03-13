@@ -1,23 +1,26 @@
 """Claude Code session management — the core state hub.
 
 Manages the key mappings:
-  Window→Session (window_states): which Claude session_id a window holds (keyed by window_id).
-  User→Thread→Window (thread_bindings): topic-to-window bindings (1 topic = 1 window_id).
+  Window→Session (window_states): which Claude session_id a window holds
+    (keyed by composite ref like "session_name:@window_id").
+  User→Thread→Window (thread_bindings): topic-to-window bindings
+    (1 topic = 1 composite ref).
 
 Responsibilities:
   - Persist/load state to ~/.ccbot/state.json.
   - Sync window↔session bindings from session_map.json (written by hook).
-  - Resolve window IDs to ClaudeSession objects (JSONL file reading).
+  - Resolve composite refs to ClaudeSession objects (JSONL file reading).
   - Track per-user read offsets for unread-message detection.
   - Manage thread↔window bindings for Telegram topic routing.
   - Send keystrokes to tmux windows and retrieve message history.
-  - Maintain window_id→display name mapping for UI display.
-  - Re-resolve stale window IDs on startup (tmux server restart recovery).
+  - Maintain composite_ref→display name mapping for UI display.
+  - Re-resolve stale refs on startup (tmux server restart recovery).
+  - Migrate old-format keys (bare @id or window_name) to composite refs.
 
 Key class: SessionManager (singleton instantiated as `session_manager`).
 Key methods for thread binding access:
-  - resolve_window_for_thread: Get window_id for a user's thread
-  - iter_thread_bindings: Generator for iterating all (user_id, thread_id, window_id)
+  - resolve_window_for_thread: Get composite ref for a user's thread
+  - iter_thread_bindings: Generator for iterating all (user_id, thread_id, ref)
   - find_users_for_session: Find all users bound to a session_id
 """
 
@@ -86,13 +89,14 @@ class ClaudeSession:
 class SessionManager:
     """Manages session state for Claude Code.
 
-    All internal keys use window_id (e.g. '@0', '@12') for uniqueness.
+    All internal keys use composite refs (e.g. 'ccbot:@0', 'gtd-agents:@12')
+    for uniqueness across multiple tmux sessions.
     Display names (window_name) are stored separately for UI presentation.
 
-    window_states: window_id -> WindowState (session_id, cwd, window_name)
-    user_window_offsets: user_id -> {window_id -> byte_offset}
-    thread_bindings: user_id -> {thread_id -> window_id}
-    window_display_names: window_id -> window_name (for display)
+    window_states: composite_ref -> WindowState (session_id, cwd, window_name)
+    user_window_offsets: user_id -> {composite_ref -> byte_offset}
+    thread_bindings: user_id -> {thread_id -> composite_ref}
+    window_display_names: composite_ref -> window_name (for display)
     group_chat_ids: "user_id:thread_id" -> group chat_id (for supergroup routing)
     """
 
@@ -131,8 +135,15 @@ class SessionManager:
         logger.debug("State saved to %s", config.state_file)
 
     def _is_window_id(self, key: str) -> bool:
-        """Check if a key looks like a tmux window ID (e.g. '@0', '@12')."""
+        """Check if a key looks like a bare tmux window ID (e.g. '@0', '@12')."""
         return key.startswith("@") and len(key) > 1 and key[1:].isdigit()
+
+    def _is_composite_ref(self, key: str) -> bool:
+        """Check if a key looks like a composite ref (e.g. 'ccbot:@12', 'gtd-agents:@0')."""
+        if ":" not in key:
+            return False
+        session_name, _, window_id = key.partition(":")
+        return bool(session_name) and self._is_window_id(window_id)
 
     def _load_state(self) -> None:
         """Load state synchronously during initialization.
@@ -160,16 +171,18 @@ class SessionManager:
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
 
-                # Detect old format: keys that don't look like window IDs
+                # Detect old format: keys that are neither composite refs
+                # nor bare window IDs (e.g. window_name strings), or bare
+                # window IDs that need upgrading to composite refs.
                 needs_migration = False
                 for k in self.window_states:
-                    if not self._is_window_id(k):
+                    if not self._is_composite_ref(k):
                         needs_migration = True
                         break
                 if not needs_migration:
                     for bindings in self.thread_bindings.values():
                         for wid in bindings.values():
-                            if not self._is_window_id(wid):
+                            if not self._is_composite_ref(wid):
                                 needs_migration = True
                                 break
                         if needs_migration:
@@ -177,7 +190,7 @@ class SessionManager:
 
                 if needs_migration:
                     logger.info(
-                        "Detected old-format state (window_name keys), "
+                        "Detected old-format state (non-composite keys), "
                         "will re-resolve on startup"
                     )
                     pass
@@ -192,58 +205,94 @@ class SessionManager:
                 pass
 
     async def resolve_stale_ids(self) -> None:
-        """Re-resolve persisted window IDs against live tmux windows.
+        """Re-resolve persisted refs against live tmux windows.
 
-        Called on startup. Handles two cases:
-        1. Old-format migration: window_name keys → window_id keys
-        2. Stale IDs: window_id no longer exists but display name matches a live window
+        Called on startup. Handles three cases:
+        1. Composite refs (current format): 'session:@id' — validate against live windows
+        2. Bare window IDs (old format): '@id' — upgrade to composite refs
+        3. Window name keys (oldest format): 'name' — resolve to composite refs
 
-        Builds {window_name: window_id} from live windows, then remaps or drops entries.
+        Builds lookup maps from live windows, then remaps or drops entries.
         """
         windows = await tmux_manager.list_windows()
-        live_by_name: dict[str, str] = {}  # window_name -> window_id
-        live_ids: set[str] = set()
+        live_refs: set[str] = set()  # set of composite refs
+        # Map (session_name, window_name) -> composite ref for re-resolution
+        live_by_session_and_name: dict[tuple[str, str], str] = {}
+        # Map bare window_id -> composite ref (for bare ID migration)
+        live_bare_to_ref: dict[str, str] = {}
+        # Map window_name -> composite ref (for oldest format migration)
+        live_by_name: dict[str, str] = {}
+
         for w in windows:
-            live_by_name[w.window_name] = w.window_id
-            live_ids.add(w.window_id)
+            live_refs.add(w.ref)
+            live_by_session_and_name[(w.session_name, w.window_name)] = w.ref
+            live_bare_to_ref[w.window_id] = w.ref
+            live_by_name[w.window_name] = w.ref
 
         changed = False
+        # Track old_key -> new_ref remapping so thread_bindings and offsets
+        # can re-resolve even after display names are updated in window_states phase.
+        ref_remap: dict[str, str] = {}
 
         # --- Migrate window_states ---
         new_window_states: dict[str, WindowState] = {}
         for key, ws in self.window_states.items():
-            if self._is_window_id(key):
-                if key in live_ids:
+            if self._is_composite_ref(key):
+                if key in live_refs:
                     new_window_states[key] = ws
                 else:
-                    # Stale ID — try re-resolve by display name
-                    display = self.window_display_names.get(key, ws.window_name or key)
-                    new_id = live_by_name.get(display)
-                    if new_id:
+                    # Stale composite ref — try re-resolve by session + display name
+                    session_name, _, bare_id = key.partition(":")
+                    display = self.window_display_names.get(
+                        key, ws.window_name or bare_id
+                    )
+                    new_ref = live_by_session_and_name.get((session_name, display))
+                    if new_ref:
                         logger.info(
-                            "Re-resolved stale window_id %s -> %s (name=%s)",
+                            "Re-resolved stale ref %s -> %s (name=%s)",
                             key,
-                            new_id,
+                            new_ref,
                             display,
                         )
-                        new_window_states[new_id] = ws
+                        new_window_states[new_ref] = ws
                         ws.window_name = display
-                        self.window_display_names[new_id] = display
+                        self.window_display_names[new_ref] = display
                         self.window_display_names.pop(key, None)
+                        ref_remap[key] = new_ref
                         changed = True
                     else:
                         logger.info(
                             "Dropping stale window_state: %s (name=%s)", key, display
                         )
                         changed = True
+            elif self._is_window_id(key):
+                # Old format: bare window ID — upgrade to composite ref
+                new_ref = live_bare_to_ref.get(key)
+                if new_ref:
+                    logger.info("Migrating bare window_id %s -> %s", key, new_ref)
+                    new_window_states[new_ref] = ws
+                    if ws.window_name:
+                        self.window_display_names[new_ref] = ws.window_name
+                    # Migrate display name from old bare key
+                    old_display = self.window_display_names.pop(key, None)
+                    if old_display:
+                        self.window_display_names[new_ref] = old_display
+                    ref_remap[key] = new_ref
+                    changed = True
+                else:
+                    logger.info(
+                        "Dropping stale bare window_id: %s (no live window)", key
+                    )
+                    changed = True
             else:
-                # Old format: key is window_name
-                new_id = live_by_name.get(key)
-                if new_id:
-                    logger.info("Migrating window_state key %s -> %s", key, new_id)
+                # Oldest format: key is window_name
+                new_ref = live_by_name.get(key)
+                if new_ref:
+                    logger.info("Migrating window_name key %s -> %s", key, new_ref)
                     ws.window_name = key
-                    new_window_states[new_id] = ws
-                    self.window_display_names[new_id] = key
+                    new_window_states[new_ref] = ws
+                    self.window_display_names[new_ref] = key
+                    ref_remap[key] = new_ref
                     changed = True
                 else:
                     logger.info(
@@ -252,50 +301,47 @@ class SessionManager:
                     changed = True
         self.window_states = new_window_states
 
+        # Helper to remap a ref/id/name using remap table or live lookups
+        def _remap(val: str) -> str | None:
+            """Remap a stale or old-format ref to a live composite ref."""
+            # Already remapped during window_states phase
+            if val in ref_remap:
+                return ref_remap[val]
+            # Already live
+            if val in live_refs:
+                return val
+            # Stale composite ref — try session + display name
+            if self._is_composite_ref(val):
+                session_name, _, bare_id = val.partition(":")
+                display = self.window_display_names.get(val, bare_id)
+                return live_by_session_and_name.get((session_name, display))
+            # Bare window ID
+            if self._is_window_id(val):
+                return live_bare_to_ref.get(val)
+            # Window name
+            return live_by_name.get(val)
+
         # --- Migrate thread_bindings ---
         for uid, bindings in self.thread_bindings.items():
             new_bindings: dict[int, str] = {}
             for tid, val in bindings.items():
-                if self._is_window_id(val):
-                    if val in live_ids:
-                        new_bindings[tid] = val
-                    else:
-                        display = self.window_display_names.get(val, val)
-                        new_id = live_by_name.get(display)
-                        if new_id:
-                            logger.info(
-                                "Re-resolved thread binding %s -> %s (name=%s)",
-                                val,
-                                new_id,
-                                display,
-                            )
-                            new_bindings[tid] = new_id
-                            self.window_display_names[new_id] = display
-                            changed = True
-                        else:
-                            logger.info(
-                                "Dropping stale thread binding: user=%d, thread=%d, wid=%s",
-                                uid,
-                                tid,
-                                val,
-                            )
-                            changed = True
-                else:
-                    # Old format: val is window_name
-                    new_id = live_by_name.get(val)
-                    if new_id:
-                        logger.info("Migrating thread binding %s -> %s", val, new_id)
-                        new_bindings[tid] = new_id
-                        self.window_display_names[new_id] = val
-                        changed = True
-                    else:
+                new_ref = _remap(val)
+                if new_ref:
+                    if new_ref != val:
                         logger.info(
-                            "Dropping old-format thread binding: user=%d, thread=%d, name=%s",
-                            uid,
-                            tid,
-                            val,
+                            "Re-resolved thread binding %s -> %s", val, new_ref
                         )
                         changed = True
+                    new_bindings[tid] = new_ref
+                else:
+                    logger.info(
+                        "Dropping stale thread binding: "
+                        "user=%d, thread=%d, ref=%s",
+                        uid,
+                        tid,
+                        val,
+                    )
+                    changed = True
             self.thread_bindings[uid] = new_bindings
 
         # Remove empty user entries
@@ -307,36 +353,25 @@ class SessionManager:
         for uid, offsets in self.user_window_offsets.items():
             new_offsets: dict[str, int] = {}
             for key, offset in offsets.items():
-                if self._is_window_id(key):
-                    if key in live_ids:
-                        new_offsets[key] = offset
-                    else:
-                        display = self.window_display_names.get(key, key)
-                        new_id = live_by_name.get(display)
-                        if new_id:
-                            new_offsets[new_id] = offset
-                            changed = True
-                        else:
-                            changed = True
+                new_ref = _remap(key)
+                if new_ref:
+                    if new_ref != key:
+                        changed = True
+                    new_offsets[new_ref] = offset
                 else:
-                    new_id = live_by_name.get(key)
-                    if new_id:
-                        new_offsets[new_id] = offset
-                        changed = True
-                    else:
-                        changed = True
+                    changed = True
             self.user_window_offsets[uid] = new_offsets
 
         if changed:
             self._save_state()
             logger.info("Startup re-resolution complete")
 
-        # Clean up session_map.json: stale window IDs and old-format keys
-        await self._cleanup_stale_session_map_entries(live_ids)
+        # Clean up session_map.json: stale entries and old-format keys
+        await self._cleanup_stale_session_map_entries(live_refs)
         await self._cleanup_old_format_session_map_keys()
 
     async def _cleanup_old_format_session_map_keys(self) -> None:
-        """Remove old-format keys (window_name instead of @window_id) from session_map.json."""
+        """Remove old-format keys (not composite refs) from session_map.json."""
         if not config.session_map_file.exists():
             return
         try:
@@ -346,11 +381,10 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
         old_keys = [
             key
             for key in session_map
-            if key.startswith(prefix) and not self._is_window_id(key[len(prefix) :])
+            if not self._is_composite_ref(key)
         ]
         if not old_keys:
             return
@@ -362,12 +396,12 @@ class SessionManager:
             "Cleaned up %d old-format session_map keys: %s", len(old_keys), old_keys
         )
 
-    async def _cleanup_stale_session_map_entries(self, live_ids: set[str]) -> None:
+    async def _cleanup_stale_session_map_entries(self, live_refs: set[str]) -> None:
         """Remove entries for tmux windows that no longer exist.
 
         When windows are closed externally (outside ccbot), session_map.json
-        retains orphan references. This cleanup removes entries whose window_id
-        is not in the current set of live tmux windows.
+        retains orphan references. This cleanup removes entries whose composite
+        ref is not in the current set of live tmux windows.
         """
         if not config.session_map_file.exists():
             return
@@ -378,13 +412,10 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
         stale_keys = [
             key
             for key in session_map
-            if key.startswith(prefix)
-            and self._is_window_id(key[len(prefix) :])
-            and key[len(prefix) :] not in live_ids
+            if self._is_composite_ref(key) and key not in live_refs
         ]
         if not stale_keys:
             return
@@ -461,18 +492,26 @@ class SessionManager:
         return user_id
 
     async def wait_for_session_map_entry(
-        self, window_id: str, timeout: float = 5.0, interval: float = 0.5
+        self, window_ref: str, timeout: float = 5.0, interval: float = 0.5
     ) -> bool:
-        """Poll session_map.json until an entry for window_id appears.
+        """Poll session_map.json until an entry for window_ref appears.
+
+        Args:
+            window_ref: Composite ref (e.g. 'ccbot:@12') or bare window ID
+                        (bare IDs are prefixed with config.tmux_session_name for compat)
 
         Returns True if the entry was found within timeout, False otherwise.
         """
+        # Support both composite refs and bare window IDs (backward compat)
+        if self._is_composite_ref(window_ref):
+            key = window_ref
+        else:
+            key = f"{config.tmux_session_name}:{window_ref}"
         logger.debug(
-            "Waiting for session_map entry: window_id=%s, timeout=%.1f",
-            window_id,
+            "Waiting for session_map entry: key=%s, timeout=%.1f",
+            key,
             timeout,
         )
-        key = f"{config.tmux_session_name}:{window_id}"
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
             try:
@@ -484,7 +523,7 @@ class SessionManager:
                     if info.get("session_id"):
                         # Found — load into window_states immediately
                         logger.debug(
-                            "session_map entry found for window_id %s", window_id
+                            "session_map entry found for key %s", key
                         )
                         await self.load_session_map()
                         return True
@@ -492,15 +531,16 @@ class SessionManager:
                 pass
             await asyncio.sleep(interval)
         logger.warning(
-            "Timed out waiting for session_map entry: window_id=%s", window_id
+            "Timed out waiting for session_map entry: key=%s", key
         )
         return False
 
     async def load_session_map(self) -> None:
         """Read session_map.json and update window_states with new session associations.
 
-        Keys in session_map are formatted as "tmux_session:window_id" (e.g. "ccbot:@12").
-        Only entries matching our tmux_session_name are processed.
+        Keys in session_map are composite refs: "session_name:@window_id"
+        (e.g. "ccbot:@12", "gtd-agents:@5"). All valid entries are processed
+        regardless of which tmux session they belong to.
         Also cleans up window_states entries not in current session_map.
         Updates window_display_names from the "window_name" field in values.
         """
@@ -513,28 +553,24 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
-        valid_wids: set[str] = set()
+        valid_refs: set[str] = set()
         changed = False
 
         for key, info in session_map.items():
-            # Only process entries for our tmux session
-            if not key.startswith(prefix):
+            # Only process entries that are valid composite refs
+            if not self._is_composite_ref(key):
                 continue
-            window_id = key[len(prefix) :]
-            if not self._is_window_id(window_id):
-                continue
-            valid_wids.add(window_id)
+            valid_refs.add(key)
             new_sid = info.get("session_id", "")
             new_cwd = info.get("cwd", "")
             new_wname = info.get("window_name", "")
             if not new_sid:
                 continue
-            state = self.get_window_state(window_id)
+            state = self.get_window_state(key)
             if state.session_id != new_sid or state.cwd != new_cwd:
                 logger.info(
-                    "Session map: window_id %s updated sid=%s, cwd=%s",
-                    window_id,
+                    "Session map: %s updated sid=%s, cwd=%s",
+                    key,
                     new_sid,
                     new_cwd,
                 )
@@ -544,15 +580,15 @@ class SessionManager:
             # Update display name
             if new_wname:
                 state.window_name = new_wname
-                if self.window_display_names.get(window_id) != new_wname:
-                    self.window_display_names[window_id] = new_wname
+                if self.window_display_names.get(key) != new_wname:
+                    self.window_display_names[key] = new_wname
                     changed = True
 
         # Clean up window_states entries not in current session_map.
-        stale_wids = [w for w in self.window_states if w and w not in valid_wids]
-        for wid in stale_wids:
-            logger.info("Removing stale window_state: %s", wid)
-            del self.window_states[wid]
+        stale_refs = [r for r in self.window_states if r and r not in valid_refs]
+        for ref in stale_refs:
+            logger.info("Removing stale window_state: %s", ref)
+            del self.window_states[ref]
             changed = True
 
         if changed:
