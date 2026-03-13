@@ -68,7 +68,7 @@ async def update_status_message(
             )
         return
 
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await tmux_manager.capture_pane(w.ref)
     if not pane_text:
         # Transient capture failure - keep existing status message
         return
@@ -142,7 +142,7 @@ async def status_poll_loop(bot: Bot) -> None:
                             # Topic deleted — kill window, unbind, and clean up state
                             w = await tmux_manager.find_window_by_id(wid)
                             if w:
-                                await tmux_manager.kill_window(w.window_id)
+                                await tmux_manager.kill_window(w.ref)
                             session_manager.unbind_thread(user_id, thread_id)
                             await clear_topic_state(user_id, thread_id, bot)
                             logger.info(

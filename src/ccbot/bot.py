@@ -233,7 +233,7 @@ async def screenshot_command(
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
         return
 
-    text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
+    text = await tmux_manager.capture_pane(w.ref, with_ansi=True)
     if not text:
         await safe_reply(update.message, "❌ Failed to capture pane content.")
         return
@@ -298,7 +298,7 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Send Escape control character (no enter)
-    await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
+    await tmux_manager.send_keys(w.ref, "\x1b", enter=False)
     await safe_reply(update.message, "⎋ Sent Escape")
 
 
@@ -318,17 +318,18 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
-        await safe_reply(update.message, f"Window '{wid}' no longer exists.")
+        display = session_manager.get_display_name(wid)
+        await safe_reply(update.message, f"Window '{display}' no longer exists.")
         return
 
     # Send /usage command to Claude Code TUI
-    await tmux_manager.send_keys(w.window_id, "/usage")
+    await tmux_manager.send_keys(w.ref, "/usage")
     # Wait for the modal to render
     await asyncio.sleep(2.0)
     # Capture the pane content
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await tmux_manager.capture_pane(w.ref)
     # Dismiss the modal
-    await tmux_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
+    await tmux_manager.send_keys(w.ref, "Escape", enter=False, literal=False)
 
     if not pane_text:
         await safe_reply(update.message, "Failed to capture usage info.")
@@ -419,7 +420,7 @@ async def topic_closed_handler(
         display = session_manager.get_display_name(wid)
         w = await tmux_manager.find_window_by_id(wid)
         if w:
-            await tmux_manager.kill_window(w.window_id)
+            await tmux_manager.kill_window(w.ref)
             logger.info(
                 "Topic closed: killed window %s (user=%d, thread=%d)",
                 display,
@@ -881,16 +882,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if wid is None:
         # Unbound topic — check for unbound windows first
         all_windows = await tmux_manager.list_windows()
-        bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
+        bound_refs = {ref for _, _, ref in session_manager.iter_thread_bindings()}
         unbound = [
-            (w.window_id, w.window_name, w.cwd)
+            (w.ref, w.window_name, w.cwd)
             for w in all_windows
-            if w.window_id not in bound_ids
+            if w.ref not in bound_refs
         ]
         logger.debug(
             "Window picker check: all=%s, bound=%s, unbound=%s",
             [w.window_name for w in all_windows],
-            bound_ids,
+            bound_refs,
             [name for _, name, _ in unbound],
         )
 
@@ -955,7 +956,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Check for pending interactive UI before sending text.
     # This catches UIs (permission prompts, etc.) that status polling might have missed.
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await tmux_manager.capture_pane(w.ref)
     if pane_text and is_interactive_ui(pane_text):
         # UI detected — show it to user, then send text (acts as Enter)
         logger.info(
@@ -1543,13 +1544,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Window no longer exists", show_alert=True)
             return
 
-        text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
+        text = await tmux_manager.capture_pane(w.ref, with_ansi=True)
         if not text:
             await query.answer("Failed to capture pane", show_alert=True)
             return
 
         png_bytes = await text_to_image(text, with_ansi=True)
-        keyboard = _build_screenshot_keyboard(window_id)
+        keyboard = _build_screenshot_keyboard(w.ref)
         try:
             await query.edit_message_media(
                 media=InputMediaDocument(
@@ -1571,9 +1572,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
+            await tmux_manager.send_keys(w.ref, "Up", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, user.id, w.ref, thread_id)
         await query.answer()
 
     # Interactive UI: Down arrow
@@ -1582,11 +1583,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Down", enter=False, literal=False
-            )
+            await tmux_manager.send_keys(w.ref, "Down", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, user.id, w.ref, thread_id)
         await query.answer()
 
     # Interactive UI: Left arrow
@@ -1595,11 +1594,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Left", enter=False, literal=False
-            )
+            await tmux_manager.send_keys(w.ref, "Left", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, user.id, w.ref, thread_id)
         await query.answer()
 
     # Interactive UI: Right arrow
@@ -1608,11 +1605,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Right", enter=False, literal=False
-            )
+            await tmux_manager.send_keys(w.ref, "Right", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, user.id, w.ref, thread_id)
         await query.answer()
 
     # Interactive UI: Escape
@@ -1621,9 +1616,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Escape", enter=False, literal=False
-            )
+            await tmux_manager.send_keys(w.ref, "Escape", enter=False, literal=False)
             await clear_interactive_msg(user.id, context.bot, thread_id)
         await query.answer("⎋ Esc")
 
@@ -1633,11 +1626,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Enter", enter=False, literal=False
-            )
+            await tmux_manager.send_keys(w.ref, "Enter", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, user.id, w.ref, thread_id)
         await query.answer("⏎ Enter")
 
     # Interactive UI: Space
@@ -1646,11 +1637,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Space", enter=False, literal=False
-            )
+            await tmux_manager.send_keys(w.ref, "Space", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, user.id, w.ref, thread_id)
         await query.answer("␣ Space")
 
     # Interactive UI: Tab
@@ -1659,9 +1648,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
-            await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
+            await tmux_manager.send_keys(w.ref, "Tab", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, user.id, w.ref, thread_id)
         await query.answer("⇥ Tab")
 
     # Interactive UI: refresh display
@@ -1693,16 +1682,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         await tmux_manager.send_keys(
-            w.window_id, tmux_key, enter=enter, literal=literal
+            w.ref, tmux_key, enter=enter, literal=literal
         )
         await query.answer(_KEY_LABELS.get(key_id, key_id))
 
         # Refresh screenshot after key press
         await asyncio.sleep(0.5)
-        text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
+        text = await tmux_manager.capture_pane(w.ref, with_ansi=True)
         if text:
             png_bytes = await text_to_image(text, with_ansi=True)
-            keyboard = _build_screenshot_keyboard(window_id)
+            keyboard = _build_screenshot_keyboard(w.ref)
             try:
                 await query.edit_message_media(
                     media=InputMediaDocument(

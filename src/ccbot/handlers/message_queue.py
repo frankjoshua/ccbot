@@ -581,7 +581,7 @@ async def _check_and_send_status(
     if not w:
         return
 
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await tmux_manager.capture_pane(w.ref)
     if not pane_text:
         return
 

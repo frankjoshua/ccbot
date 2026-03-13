@@ -864,7 +864,7 @@ class SessionManager:
         window = await tmux_manager.find_window_by_id(window_id)
         if not window:
             return False, "Window not found (may have been closed)"
-        success = await tmux_manager.send_keys(window.window_id, text)
+        success = await tmux_manager.send_keys(window.ref, text)
         if success:
             return True, f"Sent to {display}"
         return False, "Failed to send keys"

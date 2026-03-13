@@ -159,7 +159,7 @@ async def handle_interactive_ui(
         return False
 
     # Capture plain text (no ANSI colors)
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await tmux_manager.capture_pane(w.ref)
     if not pane_text:
         logger.debug("No pane text captured for window_id %s", window_id)
         return False

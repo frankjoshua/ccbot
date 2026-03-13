@@ -80,9 +80,9 @@ def build_window_picker(
     """Build window picker UI for unbound tmux windows.
 
     Args:
-        windows: List of (window_id, window_name, cwd) tuples.
+        windows: List of (composite_ref, window_name, cwd) tuples.
 
-    Returns: (text, keyboard, window_ids) where window_ids is the ordered list for caching.
+    Returns: (text, keyboard, refs) where refs is the ordered list of composite refs for caching.
     """
     window_ids = [wid for wid, _, _ in windows]
 
@@ -91,9 +91,14 @@ def build_window_picker(
         "These windows are running but not bound to any topic.",
         "Pick one to attach it here, or start a new session.\n",
     ]
-    for _wid, name, cwd in windows:
+    for ref, name, cwd in windows:
         display_cwd = cwd.replace(str(Path.home()), "~")
-        lines.append(f"• `{name}` — {display_cwd}")
+        # Show session_name/window_name for cross-session clarity
+        session_name = ref.partition(":")[0] if ":" in ref else ""
+        if session_name:
+            lines.append(f"• `{session_name}/{name}` — {display_cwd}")
+        else:
+            lines.append(f"• `{name}` — {display_cwd}")
 
     buttons: list[list[InlineKeyboardButton]] = []
     for i in range(0, len(windows), 2):
