@@ -2,8 +2,8 @@
 
 Handles two execution modes:
   1. `ccbot hook` — delegates to hook.hook_main() for Claude Code hook processing.
-  2. Default — configures logging, initializes tmux session, and starts the
-     Telegram bot polling loop via bot.create_bot().
+  2. Default — configures logging and starts the Telegram bot polling loop
+     via bot.create_bot().  ccbot is observer-only; no tmux session is created.
 """
 
 import logging

@@ -57,10 +57,6 @@ class Config:
                 "Expected comma-separated Telegram user IDs."
             ) from e
 
-        # Tmux session name and window naming
-        self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
-        self.tmux_main_window_name = "__main__"
-
         # Claude command to run in new windows
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
 
@@ -106,11 +102,10 @@ class Config:
 
         logger.debug(
             "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
-            "tmux_session=%s, claude_projects_path=%s",
+            "claude_projects_path=%s",
             self.config_dir,
             self.telegram_bot_token[:8],
             len(self.allowed_users),
-            self.tmux_session_name,
             self.claude_projects_path,
         )
 

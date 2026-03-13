@@ -4,7 +4,7 @@ Wraps libtmux to provide async-friendly operations across ALL tmux sessions:
   - list_windows / find_window_by_name: discover Claude Code windows.
   - capture_pane: read terminal content (plain or with ANSI colors).
   - send_keys: forward user input or control keys to a window.
-  - create_window / kill_window: lifecycle management.
+  - create_session / kill_window: lifecycle management.
 
 Windows are identified by composite refs: "session_name:@window_id".
 
@@ -122,10 +122,6 @@ class TmuxManager:
             for session in server.sessions:
                 for window in session.windows:
                     name = window.window_name or ""
-                    # Skip the main window (placeholder window)
-                    if name == config.tmux_main_window_name:
-                        continue
-
                     try:
                         # Get the active pane's current path and command
                         pane = window.active_pane
@@ -464,100 +460,6 @@ class TmuxManager:
                 return False, f"Failed to create session: {e}", ""
 
         return await asyncio.to_thread(_create)
-
-    # DEPRECATED: create_window uses get_or_create_session which creates a ccbot
-    # session. Will be replaced in Task 4 with create_session that creates
-    # windows in the appropriate existing session.
-    async def create_window(
-        self,
-        work_dir: str,
-        window_name: str | None = None,
-        start_claude: bool = True,
-        resume_session_id: str | None = None,
-    ) -> tuple[bool, str, str, str]:
-        """Create a new tmux window and optionally start Claude Code.
-
-        DEPRECATED: This still creates windows in a single 'ccbot' session.
-        Will be replaced in Task 4.
-
-        Args:
-            work_dir: Working directory for the new window
-            window_name: Optional window name (defaults to directory name)
-            start_claude: Whether to start claude command
-            resume_session_id: If set, append --resume <id> to claude command
-
-        Returns:
-            Tuple of (success, message, window_name, window_id)
-        """
-        # Validate directory first
-        path = Path(work_dir).expanduser().resolve()
-        if not path.exists():
-            return False, f"Directory does not exist: {work_dir}", "", ""
-        if not path.is_dir():
-            return False, f"Not a directory: {work_dir}", "", ""
-
-        # Create window name, adding suffix if name already exists
-        final_window_name = window_name if window_name else path.name
-
-        # Check for existing window name
-        base_name = final_window_name
-        counter = 2
-        while await self.find_window_by_name(final_window_name):
-            final_window_name = f"{base_name}-{counter}"
-            counter += 1
-
-        # Create window in thread
-        def _create_and_start() -> tuple[bool, str, str, str]:
-            server = libtmux.Server()
-            session_name = config.tmux_session_name
-            session = server.sessions.get(session_name=session_name)
-            if not session:
-                session = server.new_session(
-                    session_name=session_name,
-                    start_directory=str(Path.home()),
-                )
-                if session.windows:
-                    session.windows[0].rename_window(config.tmux_main_window_name)
-            self._scrub_session_env(session)
-            try:
-                # Create new window
-                window = session.new_window(
-                    window_name=final_window_name,
-                    start_directory=str(path),
-                )
-
-                wid = window.window_id or ""
-
-                # Prevent Claude Code from overriding window name
-                window.set_window_option("allow-rename", "off")
-
-                # Start Claude Code if requested
-                if start_claude:
-                    pane = window.active_pane
-                    if pane:
-                        cmd = config.claude_command
-                        if resume_session_id:
-                            cmd = f"{cmd} --resume {resume_session_id}"
-                        pane.send_keys(cmd, enter=True)
-
-                logger.info(
-                    "Created window '%s' (id=%s) at %s",
-                    final_window_name,
-                    wid,
-                    path,
-                )
-                return (
-                    True,
-                    f"Created window '{final_window_name}' at {path}",
-                    final_window_name,
-                    wid,
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to create window: {e}")
-                return False, f"Failed to create window: {e}", "", ""
-
-        return await asyncio.to_thread(_create_and_start)
 
 
 # Global instance — no longer tied to a single session

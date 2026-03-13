@@ -373,32 +373,27 @@ class SessionMonitor:
         return new_messages
 
     async def _load_current_session_map(self) -> dict[str, str]:
-        """Load current session_map and return window_key -> session_id mapping.
+        """Load current session_map and return composite_ref -> session_id mapping.
 
-        Keys in session_map are formatted as "tmux_session:window_id"
-        (e.g. "ccbot:@12"). Old-format keys ("ccbot:window_name") are also
-        accepted so that sessions running before a code upgrade continue
-        to be monitored until the hook re-fires with new format.
-        Only entries matching our tmux_session_name are processed.
+        Keys in session_map are composite refs: "tmux_session:@window_id"
+        (e.g. "ccbot:@12", "gtd-agents:@5"). ALL valid entries are processed
+        regardless of which tmux session they belong to.
         """
-        window_to_session: dict[str, str] = {}
+        ref_to_session: dict[str, str] = {}
         if config.session_map_file.exists():
             try:
                 async with aiofiles.open(config.session_map_file, "r") as f:
                     content = await f.read()
                 session_map = json.loads(content)
-                prefix = f"{config.tmux_session_name}:"
                 for key, info in session_map.items():
-                    # Only process entries for our tmux session
-                    if not key.startswith(prefix):
+                    if ":" not in key:
                         continue
-                    window_key = key[len(prefix) :]
                     session_id = info.get("session_id", "")
                     if session_id:
-                        window_to_session[window_key] = session_id
+                        ref_to_session[key] = session_id
             except (json.JSONDecodeError, OSError):
                 pass
-        return window_to_session
+        return ref_to_session
 
     async def _cleanup_all_stale_sessions(self) -> None:
         """Clean up all tracked sessions not in current session_map (used on startup)."""

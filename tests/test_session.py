@@ -13,7 +13,6 @@ def sm(tmp_path):
     mock_config = MagicMock()
     mock_config.state_file = tmp_path / "state.json"
     mock_config.session_map_file = tmp_path / "session_map.json"
-    mock_config.tmux_session_name = "ccbot"
     mock_config.claude_projects_path = tmp_path / "projects"
 
     with patch("ccbot.session.config", mock_config):
@@ -127,7 +126,7 @@ async def test_load_session_map_composite_keys(sm, tmp_path):
 
 @pytest.mark.asyncio
 async def test_load_session_map_no_filter_by_session(sm, tmp_path):
-    """load_session_map should load entries from ALL sessions, not just config.tmux_session_name."""
+    """load_session_map should load entries from ALL sessions."""
     session_map = {
         "other-session:@1": {
             "session_id": "sess-other",

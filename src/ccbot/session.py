@@ -497,19 +497,16 @@ class SessionManager:
         """Poll session_map.json until an entry for window_ref appears.
 
         Args:
-            window_ref: Composite ref (e.g. 'ccbot:@12') or bare window ID
-                        (bare IDs are prefixed with config.tmux_session_name for compat)
+            window_ref: Composite ref (e.g. 'gtd-agents:@12') or bare window ID.
+                        Bare IDs (e.g. '@12') are matched against any session
+                        by scanning all keys.
 
         Returns True if the entry was found within timeout, False otherwise.
         """
-        # Support both composite refs and bare window IDs (backward compat)
-        if self._is_composite_ref(window_ref):
-            key = window_ref
-        else:
-            key = f"{config.tmux_session_name}:{window_ref}"
+        is_composite = self._is_composite_ref(window_ref)
         logger.debug(
-            "Waiting for session_map entry: key=%s, timeout=%.1f",
-            key,
+            "Waiting for session_map entry: ref=%s, timeout=%.1f",
+            window_ref,
             timeout,
         )
         deadline = asyncio.get_event_loop().time() + timeout
@@ -519,11 +516,19 @@ class SessionManager:
                     async with aiofiles.open(config.session_map_file, "r") as f:
                         content = await f.read()
                     session_map = json.loads(content)
-                    info = session_map.get(key, {})
-                    if info.get("session_id"):
-                        # Found — load into window_states immediately
+                    if is_composite:
+                        info = session_map.get(window_ref, {})
+                        found = bool(info.get("session_id"))
+                    else:
+                        # Bare window ID — scan all keys for a matching suffix
+                        found = any(
+                            k.endswith(f":{window_ref}")
+                            and v.get("session_id")
+                            for k, v in session_map.items()
+                        )
+                    if found:
                         logger.debug(
-                            "session_map entry found for key %s", key
+                            "session_map entry found for ref %s", window_ref
                         )
                         await self.load_session_map()
                         return True
@@ -531,7 +536,7 @@ class SessionManager:
                 pass
             await asyncio.sleep(interval)
         logger.warning(
-            "Timed out waiting for session_map entry: key=%s", key
+            "Timed out waiting for session_map entry: ref=%s", window_ref
         )
         return False
 
