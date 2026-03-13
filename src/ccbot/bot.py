@@ -1007,14 +1007,16 @@ async def _create_and_bind_window(
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
 
-    success, message, created_wname, created_wid = await tmux_manager.create_window(
+    success, message, composite_ref = await tmux_manager.create_session(
         selected_path, resume_session_id=resume_session_id
     )
+    # Extract session name for display (composite_ref is "session_name:@window_id")
+    session_display_name = composite_ref.partition(":")[0] if composite_ref else ""
+
     if success:
         logger.info(
-            "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s)",
-            created_wname,
-            created_wid,
+            "Session created: ref=%s at %s (user=%d, thread=%s, resume=%s)",
+            composite_ref,
             selected_path,
             user.id,
             pending_thread_id,
@@ -1025,32 +1027,32 @@ async def _create_and_bind_window(
         # a longer timeout to avoid silently dropping messages.
         hook_timeout = 15.0 if resume_session_id else 5.0
         hook_ok = await session_manager.wait_for_session_map_entry(
-            created_wid, timeout=hook_timeout
+            composite_ref, timeout=hook_timeout
         )
 
         # --resume creates a new session_id in the hook, but messages continue
         # writing to the resumed session's JSONL file. Override window_state to
         # track the original session_id so the monitor can route messages back.
         if resume_session_id:
-            ws = session_manager.get_window_state(created_wid)
+            ws = session_manager.get_window_state(composite_ref)
             if not hook_ok:
                 # Hook timed out — manually populate window_state so the
                 # monitor can still route messages back to this topic.
                 logger.warning(
-                    "Hook timed out for resume window %s, "
+                    "Hook timed out for resume session %s, "
                     "manually setting session_id=%s cwd=%s",
-                    created_wid,
+                    composite_ref,
                     resume_session_id,
                     selected_path,
                 )
                 ws.session_id = resume_session_id
                 ws.cwd = str(selected_path)
-                ws.window_name = created_wname
+                ws.window_name = session_display_name
                 session_manager._save_state()
             elif ws.session_id != resume_session_id:
                 logger.info(
-                    "Resume override: window %s session_id %s -> %s",
-                    created_wid,
+                    "Resume override: session %s session_id %s -> %s",
+                    composite_ref,
                     ws.session_id,
                     resume_session_id,
                 )
@@ -1058,18 +1060,18 @@ async def _create_and_bind_window(
                 session_manager._save_state()
 
         if pending_thread_id is not None:
-            # Thread bind flow: bind thread to newly created window
+            # Thread bind flow: bind thread to newly created session
             session_manager.bind_thread(
-                user.id, pending_thread_id, created_wid, window_name=created_wname
+                user.id, pending_thread_id, composite_ref, window_name=session_display_name
             )
 
-            # Rename the topic to match the window name
+            # Rename the topic to match the session name
             resolved_chat = session_manager.resolve_chat_id(user.id, pending_thread_id)
             try:
                 await context.bot.edit_forum_topic(
                     chat_id=resolved_chat,
                     message_thread_id=pending_thread_id,
-                    name=created_wname,
+                    name=session_display_name,
                 )
             except Exception as e:
                 logger.debug(f"Failed to rename topic: {e}")
@@ -1088,15 +1090,15 @@ async def _create_and_bind_window(
             )
             if pending_text:
                 logger.debug(
-                    "Forwarding pending text to window %s (len=%d)",
-                    created_wname,
+                    "Forwarding pending text to session %s (len=%d)",
+                    composite_ref,
                     len(pending_text),
                 )
                 if context.user_data is not None:
                     context.user_data.pop("_pending_thread_text", None)
                     context.user_data.pop("_pending_thread_id", None)
                 send_ok, send_msg = await session_manager.send_to_window(
-                    created_wid,
+                    composite_ref,
                     pending_text,
                 )
                 if not send_ok:

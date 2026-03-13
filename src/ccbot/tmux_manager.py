@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +39,21 @@ def parse_window_ref(ref: str) -> tuple[str, str]:
     if not session or not window_id:
         raise ValueError(f"Invalid window ref '{ref}': expected 'session:@id'")
     return session, window_id
+
+
+def make_session_name(directory: str) -> str:
+    """Generate tmux session name from directory, matching cmux convention.
+
+    Convention: {child}-{parent}, lowercased, sanitized, max 60 chars.
+    Example: /home/josh/workspace/agents/gtd -> gtd-agents
+    """
+    path = Path(directory).resolve()
+    child = path.name or "root"
+    parent = path.parent.name or "root"
+    name = f"{child}-{parent}".lower()
+    name = re.sub(r"[^a-z0-9_-]", "-", name)
+    name = name.strip("-")
+    return name[:60]
 
 
 @dataclass
@@ -387,6 +403,67 @@ class TmuxManager:
                 return False
 
         return await asyncio.to_thread(_sync_kill)
+
+    async def create_session(
+        self, work_dir: str, resume_session_id: str | None = None
+    ) -> tuple[bool, str, str]:
+        """Create a new tmux session with Claude Code, cmux-style.
+
+        Args:
+            work_dir: Working directory for the new session.
+            resume_session_id: If set, append --resume <id> to claude command.
+
+        Returns:
+            Tuple of (success, message, composite_ref) where composite_ref
+            is "session_name:@window_id".
+        """
+        # Validate directory first
+        path = Path(work_dir).expanduser().resolve()
+        if not path.exists():
+            return False, f"Directory does not exist: {work_dir}", ""
+        if not path.is_dir():
+            return False, f"Not a directory: {work_dir}", ""
+
+        session_name = make_session_name(str(path))
+
+        def _create() -> tuple[bool, str, str]:
+            server = libtmux.Server()
+
+            # Check if session already exists
+            existing = server.sessions.get(session_name=session_name)
+            if existing:
+                window = existing.windows[0]
+                wid = window.window_id or ""
+                ref = f"{session_name}:{wid}"
+                return True, f"Session '{session_name}' already exists", ref
+
+            # Build claude command
+            cmd = config.claude_command
+            if resume_session_id:
+                cmd += f" --resume {resume_session_id}"
+
+            try:
+                session = server.new_session(
+                    session_name=session_name,
+                    start_directory=str(path),
+                    window_command=cmd,
+                )
+                self._scrub_session_env(session)
+                window = session.windows[0]
+                wid = window.window_id or ""
+                ref = f"{session_name}:{wid}"
+                logger.info(
+                    "Created session '%s' (ref=%s) at %s",
+                    session_name,
+                    ref,
+                    path,
+                )
+                return True, f"Created session '{session_name}'", ref
+            except Exception as e:
+                logger.error(f"Failed to create session: {e}")
+                return False, f"Failed to create session: {e}", ""
+
+        return await asyncio.to_thread(_create)
 
     # DEPRECATED: create_window uses get_or_create_session which creates a ccbot
     # session. Will be replaced in Task 4 with create_session that creates
