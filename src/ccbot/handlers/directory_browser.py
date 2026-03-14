@@ -104,8 +104,12 @@ def build_window_picker(
     for i in range(0, len(windows), 2):
         row = []
         for j in range(min(2, len(windows) - i)):
-            name = windows[i + j][1]
-            display = name[:12] + "…" if len(name) > 13 else name
+            ref = windows[i + j][0]
+            wname = windows[i + j][1]
+            # Show session name on button for cross-session clarity
+            session_name = ref.partition(":")[0] if ":" in ref else ""
+            label = f"{session_name}/{wname}" if session_name else wname
+            display = label[:16] + "…" if len(label) > 17 else label
             row.append(
                 InlineKeyboardButton(
                     f"🖥 {display}", callback_data=f"{CB_WIN_BIND}{i + j}"
