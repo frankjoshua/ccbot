@@ -69,3 +69,4 @@ venv.bak/
 # Project specific
 .uv/
 uv.lock
+.ruff_cache/
