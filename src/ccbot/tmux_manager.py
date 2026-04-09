@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,9 +72,13 @@ class TmuxWindow:
 class TmuxManager:
     """Manages tmux windows for Claude Code sessions across all tmux sessions."""
 
+    # TTL for cached list_windows results (seconds)
+    _CACHE_TTL = 1.0
+
     def __init__(self) -> None:
         """Initialize tmux manager."""
-        pass
+        self._cached_windows: list[TmuxWindow] | None = None
+        self._cache_time: float = 0.0
 
     def _find_pane_sync(self, ref: str) -> libtmux.Pane | None:
         """Resolve composite ref to a libtmux Pane (sync, for use in to_thread)."""
@@ -112,9 +117,16 @@ class TmuxManager:
     async def list_windows(self) -> list[TmuxWindow]:
         """List all windows across ALL tmux sessions.
 
+        Results are cached for _CACHE_TTL seconds to avoid redundant
+        libtmux Server queries from concurrent callers (status poll,
+        session monitor, message queue).
+
         Returns:
             List of TmuxWindow with window info and cwd
         """
+        now = time.monotonic()
+        if self._cached_windows is not None and (now - self._cache_time) < self._CACHE_TTL:
+            return self._cached_windows
 
         def _sync_list_windows() -> list[TmuxWindow]:
             server = libtmux.Server()
@@ -151,7 +163,10 @@ class TmuxManager:
 
             return result
 
-        return await asyncio.to_thread(_sync_list_windows)
+        windows = await asyncio.to_thread(_sync_list_windows)
+        self._cached_windows = windows
+        self._cache_time = time.monotonic()
+        return windows
 
     async def find_window_by_name(self, window_name: str) -> TmuxWindow | None:
         """Find a window by its name.
