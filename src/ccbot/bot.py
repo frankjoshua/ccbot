@@ -35,6 +35,7 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -194,8 +195,6 @@ def _parse_skill_md(skill_md: Path) -> tuple[str, str] | None:
     return name, description.strip()
 
 
-import re
-
 # Telegram bot commands: 1-32 chars, lowercase letters, digits, underscores only
 _RE_VALID_BOT_COMMAND = re.compile(r"^[a-z0-9_]{1,32}$")
 
@@ -213,7 +212,11 @@ def _skill_name_to_command(name: str) -> str | None:
 
 
 def _discover_skill_commands() -> dict[str, str]:
-    """Scan Claude Code skills directory and return {command: description} for bot commands.
+    """Scan skill directories and return {command: description} for bot commands.
+
+    Scans both global (~/.claude/skills/) and project-level (.claude/skills/)
+    skill directories. Project-level skills are discovered from the cwds of
+    all active sessions in session_map.
 
     Reads YAML frontmatter from each skill's SKILL.md to extract the name and
     description fields. Walks nested directories (e.g. gstack/review/SKILL.md)
@@ -222,36 +225,58 @@ def _discover_skill_commands() -> dict[str, str]:
     bot commands.
     """
     skills: dict[str, str] = {}
-    skills_path = config.claude_skills_path
-    if not skills_path or not skills_path.is_dir():
-        return skills
 
     # Names already taken by bot handlers or CC_COMMANDS
     reserved = {
         "start", "history", "screenshot", "esc", "kill", "unbind", "usage",
     } | set(CC_COMMANDS.keys())
 
-    # Walk all SKILL.md files recursively
+    # Collect skill directories to scan
+    skill_dirs: list[Path] = []
+    if config.claude_skills_path and config.claude_skills_path.is_dir():
+        skill_dirs.append(config.claude_skills_path)
+
+    # Add project-level .claude/skills/ from active session cwds
+    if config.session_map_file.exists():
+        try:
+            import json
+            session_map = json.loads(config.session_map_file.read_text())
+            seen_cwds: set[str] = set()
+            for info in session_map.values():
+                cwd = info.get("cwd", "")
+                if not cwd or cwd in seen_cwds:
+                    continue
+                seen_cwds.add(cwd)
+                project_skills = Path(cwd) / ".claude" / "skills"
+                if project_skills.is_dir():
+                    skill_dirs.append(project_skills)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Walk all SKILL.md files from all directories
     seen_commands: set[str] = set()
-    for skill_md in sorted(skills_path.rglob("SKILL.md")):
-        result = _parse_skill_md(skill_md)
-        if result is None:
-            continue
-        name, description = result
+    for skills_path in skill_dirs:
+        for skill_md in sorted(skills_path.rglob("SKILL.md")):
+            result = _parse_skill_md(skill_md)
+            if result is None:
+                continue
+            name, description = result
 
-        cmd = _skill_name_to_command(name)
-        if cmd is None or cmd in reserved or cmd in seen_commands:
-            continue
-        seen_commands.add(cmd)
+            cmd = _skill_name_to_command(name)
+            if cmd is None or cmd in reserved or cmd in seen_commands:
+                continue
+            seen_commands.add(cmd)
 
-        # Truncate description to fit Telegram's 256-char limit for commands
-        desc = description if description else f"{name} skill"
-        first_sentence = desc.split(". ")[0].rstrip(".")
-        if len(first_sentence) > 250:
-            first_sentence = first_sentence[:247] + "..."
-        skills[cmd] = f"↗ {first_sentence}"
+            # Truncate description to fit Telegram's 256-char limit for commands
+            desc = description if description else f"{name} skill"
+            first_sentence = desc.split(". ")[0].rstrip(".")
+            if len(first_sentence) > 250:
+                first_sentence = first_sentence[:247] + "..."
+            skills[cmd] = f"↗ {first_sentence}"
 
-    logger.info("Discovered %d skill commands from %s", len(skills), skills_path)
+    logger.info(
+        "Discovered %d skill commands from %d directories", len(skills), len(skill_dirs)
+    )
     return skills
 
 
