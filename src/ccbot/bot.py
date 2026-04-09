@@ -231,12 +231,8 @@ def _discover_skill_commands() -> dict[str, str]:
         "start", "history", "screenshot", "esc", "kill", "unbind", "usage",
     } | set(CC_COMMANDS.keys())
 
-    # Collect skill directories to scan
+    # Scan project-level .claude/skills/ from active session cwds only
     skill_dirs: list[Path] = []
-    if config.claude_skills_path and config.claude_skills_path.is_dir():
-        skill_dirs.append(config.claude_skills_path)
-
-    # Add project-level .claude/skills/ from active session cwds
     if config.session_map_file.exists():
         try:
             import json
@@ -267,11 +263,11 @@ def _discover_skill_commands() -> dict[str, str]:
                 continue
             seen_commands.add(cmd)
 
-            # Truncate description to fit Telegram's 256-char limit for commands
+            # Keep descriptions short to stay under Telegram's request size limit
             desc = description if description else f"{name} skill"
-            first_sentence = desc.split(". ")[0].rstrip(".")
-            if len(first_sentence) > 250:
-                first_sentence = first_sentence[:247] + "..."
+            first_sentence = desc.split(". ")[0].split(" — ")[0].rstrip(".")
+            if len(first_sentence) > 80:
+                first_sentence = first_sentence[:77] + "..."
             skills[cmd] = f"↗ {first_sentence}"
 
     logger.info(
@@ -1928,12 +1924,15 @@ async def post_init(application: Application) -> None:
     for cmd_name, desc in skill_commands.items():
         bot_commands.append(BotCommand(cmd_name, desc))
 
-    # Telegram allows max 100 bot commands
-    if len(bot_commands) > 100:
+    # Cap total bot commands (built-in + skills) to keep the menu usable
+    max_commands = 25
+    if len(bot_commands) > max_commands:
         logger.warning(
-            "Too many bot commands (%d), truncating to 100", len(bot_commands)
+            "Too many bot commands (%d), truncating to %d",
+            len(bot_commands),
+            max_commands,
         )
-        bot_commands = bot_commands[:100]
+        bot_commands = bot_commands[:max_commands]
 
     await application.bot.set_my_commands(bot_commands)
 
