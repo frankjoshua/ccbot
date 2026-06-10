@@ -831,11 +831,35 @@ class SessionManager:
     ) -> str | None:
         """Resolve the tmux window_id for a user's thread.
 
+        Falls back to another user's binding for the same thread when both
+        users are in the same group chat: forum topics map 1:1 to windows
+        regardless of who is speaking, so any allowed user in a shared
+        supergroup topic routes to the topic's window without needing their
+        own binding row. The fallback is chat-scoped (via group_chat_ids) so
+        an identical thread_id in a different chat can never match.
+
         Returns None if thread_id is None or the thread is not bound.
         """
         if thread_id is None:
             return None
-        return self.get_window_for_thread(user_id, thread_id)
+        window_id = self.get_window_for_thread(user_id, thread_id)
+        if window_id:
+            return window_id
+
+        sender_chat = self.group_chat_ids.get(f"{user_id}:{thread_id}")
+        if sender_chat is None:
+            return None
+        for other_id, threads in self.thread_bindings.items():
+            if other_id == user_id:
+                continue
+            other_window = threads.get(thread_id)
+            if (
+                other_window
+                and self.group_chat_ids.get(f"{other_id}:{thread_id}")
+                == sender_chat
+            ):
+                return other_window
+        return None
 
     def iter_thread_bindings(self) -> Iterator[tuple[int, int, str]]:
         """Iterate all thread bindings as (user_id, thread_id, window_id).

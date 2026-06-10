@@ -282,3 +282,24 @@ def test_load_state_migrates_bare_ids(sm, tmp_path):
     # (migration happens in resolve_stale_ids, not _load_state)
     assert "@12" in sm2.window_states
     assert sm2.thread_bindings[100][200] == "@12"
+
+
+def test_resolve_window_falls_back_to_other_users_binding_same_chat(sm):
+    """A second allowed user speaking in the same group topic routes to the
+    window bound by the first user (forum topics are 1:1 with windows
+    regardless of speaker)."""
+    sm.bind_thread(user_id=111, thread_id=500, window_id="games:@1")
+    sm.set_group_chat_id(111, 500, -100123)
+    sm.set_group_chat_id(222, 500, -100123)  # learned from her group message
+
+    assert sm.resolve_window_for_thread(222, 500) == "games:@1"
+
+
+def test_resolve_window_no_fallback_across_different_chats(sm):
+    """The fallback must be chat-scoped: an identical thread_id in a
+    different chat (e.g. a bot DM) must not match another user's binding."""
+    sm.bind_thread(user_id=111, thread_id=500, window_id="games:@1")
+    sm.set_group_chat_id(111, 500, -100123)
+    sm.set_group_chat_id(222, 500, -100999)  # same thread id, different chat
+
+    assert sm.resolve_window_for_thread(222, 500) is None
