@@ -57,6 +57,14 @@ class Config:
                 "Expected comma-separated Telegram user IDs."
             ) from e
 
+        # Primary user: forwarded messages from other allowed users are tagged
+        # with the sender's name (see sender_tag.py). Defaults to the FIRST id
+        # listed in ALLOWED_USERS (the set above is unordered); override with
+        # PRIMARY_USER_ID.
+        primary_str = os.getenv("PRIMARY_USER_ID", "").strip()
+        first_allowed = allowed_users_str.split(",")[0].strip()
+        self.primary_user_id: int = int(primary_str or first_allowed)
+
         # Claude command to run in new windows
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
 

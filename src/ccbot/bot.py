@@ -59,6 +59,7 @@ from telegram.ext import (
 )
 
 from .config import config
+from .sender_tag import tag_sender_text
 from .handlers.callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -743,6 +744,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text_to_send = f"{caption}\n\n(image attached: {file_path})"
     else:
         text_to_send = f"(image attached: {file_path})"
+    text_to_send = tag_sender_text(
+        user.id, user.first_name or user.username, text_to_send, config.primary_user_id
+    )
 
     await update.message.chat.send_action(ChatAction.TYPING)
     clear_status_msg_info(user.id, thread_id)
@@ -824,6 +828,9 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.chat.send_action(ChatAction.TYPING)
     clear_status_msg_info(user.id, thread_id)
 
+    text = tag_sender_text(
+        user.id, user.first_name or user.username, text, config.primary_user_id
+    )
     success, message = await session_manager.send_to_window(wid, text)
     if not success:
         await safe_reply(update.message, f"❌ {message}")
@@ -944,6 +951,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     text = update.message.text
+    # Attribute non-primary senders (e.g. Laura) so Claude knows who's talking.
+    # Applied here so the pending-text stash and the direct send both inherit it.
+    text = tag_sender_text(
+        user.id, user.first_name or user.username, text, config.primary_user_id
+    )
 
     # Ignore text in window picker mode (only for the same thread)
     if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
