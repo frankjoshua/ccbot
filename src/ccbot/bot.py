@@ -379,7 +379,7 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await safe_reply(update.message, "❌ This command only works in a topic.")
         return
 
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
         await safe_reply(update.message, "❌ No session bound to this topic.")
         return
@@ -534,7 +534,7 @@ async def topic_closed_handler(
     if thread_id is None:
         return
 
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if wid:
         display = session_manager.get_display_name(wid)
         w = await tmux_manager.find_window_by_id(wid)
@@ -583,7 +583,7 @@ async def topic_edited_handler(
     if thread_id is None:
         return
 
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
         logger.debug(
             "Topic edited: no binding (user=%d, thread=%d)", user.id, thread_id
@@ -709,7 +709,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if wid is None:
         await safe_reply(
             update.message,
@@ -790,7 +790,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if wid is None:
         await safe_reply(
             update.message,
@@ -1013,7 +1013,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if wid is None:
         # Unbound topic — check for unbound windows first
         all_windows = await tmux_manager.list_windows()
