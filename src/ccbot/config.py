@@ -88,6 +88,11 @@ class Config:
 
         self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
 
+        # Debounce window (ms) applied before merging queued content tasks.
+        # Lets a Claude turn's fan-out (thinking + text + post-tool text) collapse
+        # into one Telegram send instead of several, reducing 429s during bursts.
+        self.coalesce_ms = int(os.getenv("CCBOT_COALESCE_MS", "400"))
+
         # Claude Code skills directory for dynamic slash command discovery
         custom_skills_path = os.getenv("CCBOT_CLAUDE_SKILLS_PATH")
         if custom_skills_path:

@@ -27,6 +27,7 @@ from telegram import Bot
 from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 
+from ..config import config
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
@@ -77,6 +78,12 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
+
+# Thinking message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
+# Subsequent thinking blocks in the same turn edit this message in place, drawing
+# from the separate editMessage rate-limit bucket instead of the sendMessage bucket.
+# Cleared when non-thinking content arrives (turn output begins).
+_thinking_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
@@ -129,6 +136,9 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     if base.content_type in ("tool_use", "tool_result"):
         return False
     if candidate.content_type in ("tool_use", "tool_result"):
+        return False
+    # Keep thinking in its own merge bucket so edit-in-place can handle it
+    if (base.content_type == "thinking") != (candidate.content_type == "thinking"):
         return False
     return True
 
@@ -227,6 +237,11 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     logger.info("Flood control lifted for user %d", user_id)
 
                 if task.task_type == "content":
+                    # Debounce: let bursty fan-out from a single Claude turn
+                    # accumulate in the queue before draining, so it can be
+                    # merged into one send instead of several.
+                    if config.coalesce_ms > 0:
+                        await asyncio.sleep(config.coalesce_ms / 1000)
                     # Try to merge consecutive content tasks
                     merged_task, merge_count = await _merge_content_tasks(
                         queue, task, lock
@@ -302,6 +317,37 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     wid = task.window_id or ""
     tid = task.thread_id or 0
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    tkey = (user_id, tid)
+
+    # Clear thinking pointer when non-thinking content arrives; the next thinking
+    # block belongs to a new turn and should start a fresh message.
+    if task.content_type != "thinking":
+        _thinking_msg_info.pop(tkey, None)
+
+    # Edit-in-place thinking: if we already sent a thinking message this turn,
+    # edit it instead of sending a new one. Edits use a separate rate-limit bucket.
+    if task.content_type == "thinking":
+        existing = _thinking_msg_info.get(tkey)
+        merged_text = "\n\n".join(task.parts) if task.parts else ""
+        if existing and existing[1] == wid and merged_text:
+            msg_id = existing[0]
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=_ensure_formatted(merged_text),
+                    parse_mode=PARSE_MODE,
+                    link_preview_options=NO_LINK_PREVIEW,
+                )
+                _thinking_msg_info[tkey] = (msg_id, wid, merged_text)
+                await _check_and_send_status(bot, user_id, wid, task.thread_id)
+                return
+            except RetryAfter:
+                raise
+            except Exception as e:
+                logger.debug("Failed to edit thinking msg %d: %s", msg_id, e)
+                _thinking_msg_info.pop(tkey, None)
+                # Fall through and send as a new message
 
     # 1. Handle tool_result editing (merged parts are edited together)
     if task.content_type == "tool_result" and task.tool_use_id:
@@ -377,6 +423,11 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
         _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
+
+    # 3b. Record thinking message ID so the next thinking block in this turn
+    # edits it in place instead of sending a new message.
+    if last_msg_id and task.content_type == "thinking":
+        _thinking_msg_info[tkey] = (last_msg_id, wid, "\n\n".join(task.parts))
 
     # 4. Send images if present (from tool_result with base64 image blocks)
     await _send_task_images(bot, chat_id, task)
@@ -665,6 +716,11 @@ def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
     """Clear status message tracking for a user (and optionally a specific thread)."""
     skey = (user_id, thread_id or 0)
     _status_msg_info.pop(skey, None)
+
+
+def clear_thinking_msg_info(user_id: int, thread_id: int | None = None) -> None:
+    """Clear thinking message tracking for a user/topic."""
+    _thinking_msg_info.pop((user_id, thread_id or 0), None)
 
 
 def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> None:

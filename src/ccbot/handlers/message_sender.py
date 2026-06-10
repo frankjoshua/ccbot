@@ -18,6 +18,7 @@ RetryAfter exceptions are re-raised so callers (queue worker) can handle them.
 
 import io
 import logging
+import time
 from typing import Any
 
 from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, Message
@@ -27,6 +28,58 @@ from ..markdown_v2 import convert_markdown
 from ..transcript_parser import TranscriptParser
 
 logger = logging.getLogger(__name__)
+
+# Circuit breaker: suppress sends to threads that fail repeatedly.
+# Key: (chat_id, thread_id_or_0) -> (consecutive_failures, suppressed_until_monotonic)
+_thread_failures: dict[tuple[int, int], tuple[int, float]] = {}
+CIRCUIT_BREAKER_THRESHOLD = 3  # failures before suppressing
+CIRCUIT_BREAKER_COOLDOWN = 60.0  # seconds to suppress after tripping
+
+
+def _circuit_open(chat_id: int, thread_id: int | None) -> bool:
+    """Return True if sends to this (chat, thread) are suppressed."""
+    key = (chat_id, thread_id or 0)
+    info = _thread_failures.get(key)
+    if not info:
+        return False
+    failures, suppressed_until = info
+    if failures < CIRCUIT_BREAKER_THRESHOLD:
+        return False
+    if time.monotonic() >= suppressed_until:
+        # Cooldown expired — reset and allow retry
+        _thread_failures.pop(key, None)
+        logger.info(
+            "Circuit breaker recovered: chat_id=%d thread_id=%s",
+            chat_id,
+            thread_id,
+        )
+        return False
+    return True
+
+
+def _record_failure(chat_id: int, thread_id: int | None) -> None:
+    """Record a send failure. Trips circuit breaker after threshold."""
+    key = (chat_id, thread_id or 0)
+    info = _thread_failures.get(key)
+    failures = (info[0] if info else 0) + 1
+    suppressed_until = time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
+    _thread_failures[key] = (failures, suppressed_until)
+    if failures == CIRCUIT_BREAKER_THRESHOLD:
+        logger.warning(
+            "Circuit breaker tripped: chat_id=%d thread_id=%s — "
+            "suppressing sends for %ds after %d consecutive failures",
+            chat_id,
+            thread_id,
+            int(CIRCUIT_BREAKER_COOLDOWN),
+            failures,
+        )
+
+
+def _record_success(chat_id: int, thread_id: int | None) -> None:
+    """Reset failure tracking on successful send."""
+    key = (chat_id, thread_id or 0)
+    if key in _thread_failures:
+        _thread_failures.pop(key, None)
 
 
 def strip_sentinels(text: str) -> str:
@@ -62,25 +115,38 @@ async def send_with_fallback(
     Returns the sent Message on success, None on failure.
     RetryAfter is re-raised for caller handling.
     """
+    thread_id = kwargs.get("message_thread_id")
+    if _circuit_open(chat_id, thread_id):
+        return None
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     try:
-        return await bot.send_message(
+        msg = await bot.send_message(
             chat_id=chat_id,
             text=_ensure_formatted(text),
             parse_mode=PARSE_MODE,
             **kwargs,
         )
+        _record_success(chat_id, thread_id)
+        return msg
     except RetryAfter:
         raise
     except Exception:
         try:
-            return await bot.send_message(
+            msg = await bot.send_message(
                 chat_id=chat_id, text=strip_sentinels(text), **kwargs
             )
+            _record_success(chat_id, thread_id)
+            return msg
         except RetryAfter:
             raise
         except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
+            _record_failure(chat_id, thread_id)
+            logger.error(
+                "Failed to send message to chat_id=%d thread_id=%s: %s",
+                chat_id,
+                thread_id,
+                e,
+            )
             return None
 
 
@@ -102,6 +168,9 @@ async def send_photo(
     """
     if not image_data:
         return
+    thread_id = kwargs.get("message_thread_id")
+    if _circuit_open(chat_id, thread_id):
+        return
     try:
         if len(image_data) == 1:
             _media_type, raw_bytes = image_data[0]
@@ -120,10 +189,17 @@ async def send_photo(
                 media=media,
                 **kwargs,
             )
+        _record_success(chat_id, thread_id)
     except RetryAfter:
         raise
     except Exception as e:
-        logger.error("Failed to send photo to %d: %s", chat_id, e)
+        _record_failure(chat_id, thread_id)
+        logger.error(
+            "Failed to send photo to chat_id=%d thread_id=%s: %s",
+            chat_id,
+            thread_id,
+            e,
+        )
 
 
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
@@ -175,6 +251,8 @@ async def safe_send(
     **kwargs: Any,
 ) -> None:
     """Send message with formatting, falling back to plain text on failure."""
+    if _circuit_open(chat_id, message_thread_id):
+        return
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     if message_thread_id is not None:
         kwargs.setdefault("message_thread_id", message_thread_id)
@@ -185,6 +263,7 @@ async def safe_send(
             parse_mode=PARSE_MODE,
             **kwargs,
         )
+        _record_success(chat_id, message_thread_id)
     except RetryAfter:
         raise
     except Exception:
@@ -192,7 +271,14 @@ async def safe_send(
             await bot.send_message(
                 chat_id=chat_id, text=strip_sentinels(text), **kwargs
             )
+            _record_success(chat_id, message_thread_id)
         except RetryAfter:
             raise
         except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
+            _record_failure(chat_id, message_thread_id)
+            logger.error(
+                "Failed to send message to chat_id=%d thread_id=%s: %s",
+                chat_id,
+                message_thread_id,
+                e,
+            )

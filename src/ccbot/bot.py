@@ -107,7 +107,6 @@ from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
-    clear_interactive_mode,
     clear_interactive_msg,
     get_interactive_msg_id,
     get_interactive_window,
@@ -1849,24 +1848,31 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             queue = get_message_queue(user_id)
             if queue:
                 await queue.join()
-            # Wait briefly for Claude Code to render the question UI
-            await asyncio.sleep(0.3)
-            handled = await handle_interactive_ui(bot, user_id, wid, thread_id)
+            # Claude Code writes the JSONL tool_use entry before rendering the
+            # UI in the terminal. Retry with backoff so a slow render still
+            # results in the keyboard appearing on the first try, instead of
+            # falling through to a useless plain-text header.
+            handled = False
+            for _ in range(6):  # ~3s total
+                await asyncio.sleep(0.5)
+                handled = await handle_interactive_ui(bot, user_id, wid, thread_id)
+                if handled:
+                    break
             if handled:
-                # Update user's read offset
-                session = await session_manager.resolve_session_for_window(wid)
-                if session and session.file_path:
+                # Update user's read offset (no JSONL read — just path + stat)
+                file_path = session_manager.file_path_for_window(wid)
+                if file_path:
                     try:
-                        file_size = Path(session.file_path).stat().st_size
+                        file_size = file_path.stat().st_size
                         session_manager.update_user_window_offset(
                             user_id, wid, file_size
                         )
                     except OSError:
                         pass
-                continue  # Don't send the normal tool_use message
-            else:
-                # UI not rendered — clear the early-set mode
-                clear_interactive_mode(user_id, thread_id)
+            # Always skip the regular tool_use notification — the keyboard is
+            # the message. If our retries failed, leave interactive_mode set
+            # so status_polling's "waiting-to-render" branch can take over.
+            continue
 
         # Any non-interactive message means the interaction is complete — delete the UI message
         if get_interactive_msg_id(user_id, thread_id):
@@ -1900,11 +1906,12 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             )
 
             # Update user's read offset to current file position
-            # This marks these messages as "read" for this user
-            session = await session_manager.resolve_session_for_window(wid)
-            if session and session.file_path:
+            # This marks these messages as "read" for this user.
+            # Fast path: no JSONL read — just path construction + stat.
+            file_path = session_manager.file_path_for_window(wid)
+            if file_path:
                 try:
-                    file_size = Path(session.file_path).stat().st_size
+                    file_size = file_path.stat().st_size
                     session_manager.update_user_window_offset(user_id, wid, file_size)
                 except OSError:
                     pass
@@ -2004,7 +2011,7 @@ def create_bot() -> Application:
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
-        .rate_limiter(AIORateLimiter(max_retries=5))
+        .rate_limiter(AIORateLimiter(max_retries=5, group_max_rate=60, group_time_period=60))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()

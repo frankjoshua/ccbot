@@ -630,6 +630,18 @@ class SessionManager:
         encoded_cwd = self._encode_cwd(cwd)
         return config.claude_projects_path / encoded_cwd / f"{session_id}.jsonl"
 
+    def file_path_for_window(self, window_id: str) -> Path | None:
+        """Fast path: return the session JSONL path for a window with zero I/O.
+
+        Uses only in-memory window_state; does not read the file or validate
+        existence. Callers that need to stat/read should handle OSError.
+        Returns None if the window has no associated session.
+        """
+        state = self.get_window_state(window_id)
+        if not state.session_id or not state.cwd:
+            return None
+        return self._build_session_file_path(state.session_id, state.cwd)
+
     async def _get_session_direct(
         self, session_id: str, cwd: str
     ) -> ClaudeSession | None:
@@ -841,12 +853,17 @@ class SessionManager:
     ) -> list[tuple[int, str, int]]:
         """Find all users whose thread-bound window maps to the given session_id.
 
+        Hot path: called for every message from every active Claude session.
+        Uses in-memory window_state lookups only — no JSONL reads, no file I/O.
+        Stale bindings (where state.session_id doesn't match any live session)
+        simply don't match and are skipped; cleanup happens elsewhere.
+
         Returns list of (user_id, window_id, thread_id) tuples.
         """
         result: list[tuple[int, str, int]] = []
         for user_id, thread_id, window_id in self.iter_thread_bindings():
-            resolved = await self.resolve_session_for_window(window_id)
-            if resolved and resolved.session_id == session_id:
+            state = self.get_window_state(window_id)
+            if state.session_id == session_id:
                 result.append((user_id, window_id, thread_id))
         return result
 
